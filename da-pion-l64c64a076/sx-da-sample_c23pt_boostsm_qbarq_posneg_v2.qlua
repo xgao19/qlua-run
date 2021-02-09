@@ -1,0 +1,732 @@
+require 'stdlib'
+require 'util/strkey'
+
+
+-- transfrom dir_str='x' to dir=0, dsign=-1
+function dir_recg(dir_str)
+   local dir, dsign
+   if "X" == dir_str then
+      dir = 0
+      dsign = 1
+   elseif "Y" == dir_str then
+      dir = 1
+      dsign = 1
+   elseif "Z" == dir_str then
+      dir = 2
+      dsign = 1
+   elseif "T" == dir_str then
+      dir = 3
+      dsign = 1
+   elseif "x" == dir_str then
+      dir = 0
+      dsign = -1
+   elseif "y" == dir_str then
+      dir = 1
+      dsign = -1
+   elseif "z" == dir_str then
+      dir = 2
+      dsign = -1
+   elseif "t" == dir_str then
+      dir = 3
+      dsign = -1
+   end
+   return dir, dsign
+end
+
+function debug_mem_print(cfg_key, msg)
+  msg = msg or ""
+  if 0 == os.node() then qcd.log_rusage(string.format("%s.rusage", cfg_key), msg) end
+  print_obj(qcd.memory_usage(), msg)
+end
+
+-- produce Wilson line Fq[x] = U[x,mu]*U[x+muhat,mu]*...*U[x+(dz-1)*muhat,mu] * Fq[x+dz*muhat]
+function wlink_Fq(U, propgrp_Fq, dir, dsign, wlen)
+   local wl_propgrp_Fq = propgrp_Fq
+
+   if 1 == dsign then
+      for i = 1, wlen do
+         wl_propgrp_Fq = U[1+dir] * wl_propgrp_Fq:shift(dir, "from_forward")
+      end
+   elseif -1 == dsign then
+      for i = 1, wlen do
+         wl_propgrp_Fq = (U[1+dir]:adjoin() * wl_propgrp_Fq):shift(dir, "from_backward")
+      end
+   else error(string.format("bad dsign='%s'"), tostring(dsign)) end
+
+   return wl_propgrp_Fq
+end
+
+-- produce Wilson line Bq[x] = Bq[x-dz*muhat]*U[x-dz*muhat,mu]*U[x-(dz1)*muhat,mu]*...*U[x-muhat,mu]
+function Bq_wlink(U, propgrp_Bq, dir, dsign, wlen)
+   local propgrp_Bq_wl = propgrp_Bq
+
+   if 1 == dsign then
+      for i = 1, wlen do
+         propgrp_Bq_wl = (propgrp_Bq_wl * U[1+dir]):shift(dir, "from_backward")
+      end
+   elseif -1 == dsign then
+      for i = 1, wlen do
+         propgrp_Bq_wl = (propgrp_Bq_wl * U[1+dir]:shift(dir, "from_backward"):adjoin()):shift(dir, "from_forward")
+      end
+   else error(string.format("bad dsign='%s'"), tostring(dsign)) end
+
+   return propgrp_Bq_wl
+end
+
+function x_iter_tmd_lpspec(
+      wlink_tmd_spec_list, Fq, Bq, gf, tmd_quda_opt)
+   local res = {}
+   local function tmd_key(b_slp)
+      local mystring = string.format("l%d_%s", #b_slp, b_slp)
+      print(mystring)
+      return string.format("l%d_%s", #b_slp, b_slp)
+   end
+
+   -- checking wlink_tmd_spec_list
+   for i, lpspec in pairs(wlink_tmd_spec_list) do
+
+      printf("table %d\n", i)
+      local v1_lpspec, v2_lpspec, b_lpspec = unpack(lpspec)
+      local v1_dir, v1_len = unpack(v1_lpspec)
+      printf("leg v1: %s, %d\n", v1_dir, v1_len)
+      local b_dir, b_min, b_max = unpack(b_lpspec)
+      printf("top b: %s, %d, %d\n", b_dir, b_min, b_max)
+      local v2_dir, v2_min, v2_max = unpack(v2_lpspec)
+      printf("leg v2: %s, %d, %d\n", v2_dir, v2_min, v2_max)
+
+      local v1_path = string.rep(v1_dir, v1_len)
+      for j = b_min, b_max do
+         local b_v1_path = string.format("%s%s", string.rep(b_dir, j), v1_path)
+         for k = v2_min, v2_max do
+            local v2_b_v1_path = string.format("%s%s", string.rep(v2_dir, k), b_v1_path)
+            printf("%s_Fq_Bq\t", v2_b_v1_path)
+         end
+      end
+      printf("\n")
+   end
+
+   local kpath = tmd_quda_opt["save"]["kpath"]
+
+   -- construct the wlink(b)*wlink(v1)*Fq and contract with v2 and Bq
+   -- v1 is a fixed leg, and v2 ranges in [v2_min, v2_max]
+   for i, lpspec in pairs(wlink_tmd_spec_list) do
+
+      local v1_lpspec, b_lpspec, v2_lpspec = unpack(lpspec)
+      local v1_dirstr, v1_len = unpack(v1_lpspec)
+      local b_dirstr, b_min, b_max = unpack(b_lpspec)
+      local v2_dirstr, v2_min, v2_max = unpack(v2_lpspec)
+
+      local v1_dir, v1_dsign = dir_recg(v1_dirstr)
+      local b_dir, b_dsign = dir_recg(b_dirstr)
+
+      local v1_tag = string.rep(v1_dirstr, v1_len)
+      local v1_Fq = wlink_Fq(gf, Fq, v1_dir, v1_dsign, v1_lpspec[2])
+      local b_v1_Fq = wlink_Fq(gf, v1_Fq, b_dir, b_dsign, b_min)
+      for j = b_min, b_max do
+         local b_tag = string.rep(b_dirstr, j)
+         local b_v1_kpath = string.format("%s/%s_%s_Fq", kpath, b_tag, v1_tag)
+         tmd_quda_opt["save"]["kpath"] = b_v1_kpath
+         
+         if j ~= b_min then b_v1_Fq = wlink_Fq(gf, v1_Fq, b_dir, b_dsign, 1) end
+
+         local qudaQCS_TMD = qcd.contract_state(
+                  tmdQuda_cntrString, { b_v1_Fq, Bq, gf }, tmd_quda_opt)
+         for k = v2_min, v2_max do
+            local v2_tag = string.rep(v2_dirstr, k)
+            print("path: %s_%s_%s_Fq_Bq", v2_tag, b_tag, v1_tag)
+            local qudaRes = qudaQCS_TMD:step(v2_tag)
+            print("qudaRes", qudaRes)
+         end --iter v2
+         qudaQCS_TMD = nil ; force_gc("qudaQCS_TMD")
+
+      end -- iter b of wl[b*v1]*Fq
+   end -- iter v1 of wl[b*v1]*Fq
+
+   -- construct the Bq*wlink(v1)*wlink(b) and contract with v2 and Fq
+   -- v1 is a fixed leg, and v2 ranges in [v2_min, v2_max]
+   for i, lpspec in pairs(wlink_tmd_spec_list) do
+
+      local v1_lpspec, b_lpspec, v2_lpspec = unpack(lpspec)
+      local v2_dirstr, v1_len = unpack(v1_lpspec)  -- exchange the direction of v1 and v2
+      local b_dirstr, b_min, b_max = unpack(b_lpspec)
+      local v1_dirstr, v2_min, v2_max = unpack(v2_lpspec) -- exchange the direction of v1 and v2
+
+      local v1_dir, v1_dsign = dir_recg(v1_dirstr)
+      local b_dir, b_dsign = dir_recg(b_dirstr)
+
+      local v1_tag = string.rep(v1_dirstr, v1_len)
+      local Bq_v1 = Bq_wlink(gf, Bq, v1_dir, v1_dsign, v1_lpspec[2])
+      local Bq_v1_b = Bq_wlink(gf, Bq_v1, b_dir, b_dsign, b_min)
+      for j = b_min, b_max do
+         local b_tag = string.rep(b_dirstr, j)
+         local kpath_v1_b = string.format("%s/Bq_%s_%s", kpath, v1_tag, b_tag)
+         tmd_quda_opt["save"]["kpath"] = kpath_v1_b
+
+         if j ~= b_min then Bq_v1_b = Bq_wlink(gf, Bq_v1_b, b_dir, b_dsign, 1) end
+
+         local qudaQCS_TMD = qcd.contract_state(
+                  tmdQuda_cntrString, { Fq, Bq_v1_b, gf }, tmd_quda_opt)
+         for k = v2_min, v2_max do
+            local v2_tag = string.rep(v2_dirstr, k)
+            print("path: %s_%s_%s_Fq_Bq", v1_tag, b_tag, v2_tag)
+            local qudaRes = qudaQCS_TMD:step(v2_tag)
+            print("qudaRes", qudaRes)
+         end --iter v2
+         qudaQCS_TMD = nil ; force_gc("qudaQCS_TMD")
+
+      end -- iter b
+   end -- iter Bq*wl[v1]
+
+end
+
+
+function c_iter_qpdf_lpspec(
+      wlink_qbarq_list, func, opt)
+   opt = opt or {}
+   local res1 = nil
+   local res = {}
+   local l0_saved = false
+   local function qpdf_key(b_slp) 
+      local mystring = string.format("l%d_%s", #b_slp, b_slp)
+      print(mystring)
+      return string.format("l%d_%s", #b_slp, b_slp)
+   end
+
+   -- checking wlink_qbarq_list
+   for i, lpspec in pairs(wlink_qbarq_list) do
+      printf("table %d\n", i)
+      local what, min, max = unpack(lpspec)
+      printf("%s, %d, %d\n", what, min, max)
+      for j = min, max do
+	 local path = string.rep(what, j)
+	 printf("%s\t", path)
+      end
+      printf("\n")
+   end
+
+   -- always save zero-link
+   local res1 = func('')
+   print("res1: ", res1)
+   if res1 then res[qpdf_key('')] = res1 end
+   l0_saved = true
+
+
+   for i, lpspec in pairs(wlink_qbarq_list) do
+      -- { ldir, lmin, lmax } or { ldir, lmax} with 
+
+      local ldir, lmin, lmax = unpack(lpspec)
+      if nil == lmax then lmin, lmax = 1, lmin end
+      -- exclude repeating zero-length
+      if 0 == lmin then 
+	 if l0_saved then lmin = 1 end
+      end
+      for l_b = lmin, lmax do
+	 local b_slpath = string.rep(ldir, l_b)
+	 print("b_slpath: ", b_slpath)
+	 local res1 = func(b_slpath) 
+	 print("res1: ", res1)
+	 if res1 then res[qpdf_key(b_slpath)] = res1 end
+	 print("res", res)
+      end
+   end
+
+   if res1 then return res end
+end
+
+
+function sample_c23pt_boostsm_cohbkw(
+        L, cfg_key, csrcgrp, ama,                             -- [1-4]
+        hslab_len_t, qpdf_len_t,                              -- [5-6]
+        src_smear_opt_q,                                      -- [7]
+        c2pt_symm_psnk_list, da_psnk_list,                                  -- [8]
+        c3pt_snk_spec_list, tsep_list, wlink_pdf_spec_list, wlink_tmd_spec_list,   -- [9-11]
+        meson_snk_G, meson_src_G,                             -- [12-13]
+        proton_snk_S, proton_src_S,                           -- [14-15]
+        gf_lpath_,                                            -- [16]
+        solver_func,                                          -- [17]
+        t_axis, ferm_bc, redo_contract, gg)                   -- [18-21]
+  assert(0 < #csrcgrp)
+  for i_tsep, tsep in ipairs(tsep_list) do 
+    assert(tsep < hslab_len_t)  -- XXX need c2pt value for ratios
+--    assert(tsep <= qpdf_len_t) 
+  end
+
+  local timer_1srcgrp = timer(string.format('1srcgrp[%d] meson_qpdf_cohbkw', #csrcgrp))
+  local csrcgrp_key = strkey.csrcgrp_str(csrcgrp)
+  redo_contract = redo_contract or {}  
+  local tt    -- timer
+  local bc_quark_t  = ferm_bc[1+t_axis]
+  local bc_meson_t  = 1 -- FIXME bc_t * conj(bc_t)
+  local bc_baryon_t = bc_quark_t * bc_quark_t * bc_quark_t
+  local lt          = L[t_axis]     -- time extent
+
+  local csrc_coh0 = csrcgrp[1]
+  local csrc0_str = strkey.csrc_str_k(csrc_coh0)
+  local tsrc_coh0 = csrc_coh0[1+t_axis]
+
+  -- build hyperslab subsets for constructing frwprop_grp, c2pt, qpdf
+  -- XXX all c2pt are psnk-projected at once, with reference point csrc_coh0
+  -- one has to correct the phases of c2pt with csrc!= csrc_coh0 as
+  --    c2pt_correct(t,psnk) = c2pt_saved(t,psnk) * exp((2*pi*i/L)*psnk*(csrc-csrc0))
+  -- (correction is done in post-process scripts)
+  local csrc_hslab = hyperslab_subset_grp(L, csrcgrp, hslab_len_t, t_axis,
+          {verbose=true})
+
+  -- scatter map for TMD prop & gf "chopping"
+  -- XXX all c3pt are qext-projected at once, with reference point csrc_coh0
+  -- one has to correct the phases of c3pt with csrc!= csrc_coh0 as
+  --    c3pt_correct(t,psnk,qext) = c3pt_saved(t,psnk,qext) * exp(-(2*pi*i/L)*(psnk-qext)*(csrc-csrc0))
+  -- (correction is done in post-process scripts)
+  local qpdf_chop_map, qpdf_L = hyperslab_subvol_scatter_grp(L, csrcgrp,
+          qpdf_len_t, t_axis,
+          { copy_network=true,  -- use the same network_geom as L
+            shift_space=false   -- DO NOT shift all sources to (0,0,0)
+          })
+  local csrc_chop0 = table_copy(csrc_coh0)
+  csrc_chop0[1+t_axis] = 0
+  local lt_chop = qpdf_L[t_axis]
+  assert(lt_chop == qpdf_len_t * #csrcgrp)
+
+  -- chopped gauge fields for contractions
+  -- gf_lpath_ is a list of gauge fields (gf_lpath_[*][*] must be a ColorMatrix, #gf_lpath_[*]==#L)
+  -- however, handle case when only one gauge field is passed
+  assert('table' == type(gf_lpath_))
+  local gf_lpath_is_list = true
+  for gf_tag, gf in pairs(gf_lpath_) do
+    if 'table' ~= type(gf) then gf_lpath_is_list = false end
+  end
+  if not gf_lpath_is_list then gf_lpath_ = { [''] = gf_lpath_ } end
+  local gf_lpath_chop_list = {}
+  for gf_tag, gf in pairs(gf_lpath_) do
+    assert(#gf == #L)
+    tt = timer('gauge_chop')
+    local gf2 = gf
+    if gg then gf2 = gauge_transform_U(gg, gf2) end                 --**
+    gf_lpath_chop_list[gf_tag] = latvec_apply(qpdf_chop_map, gf2)     ; tt('done')
+  end
+
+  -- smearing with pos and neg boost at source
+  local ksrc_tag = src_smear_opt_q.tag
+  local smfunc_ksrc_q = make_smear_func(L, src_smear_opt_q)
+  local smfunc_ksrc_a = make_smear_func(L, table_join(src_smear_opt_q,
+            {boost_scal=-1*(src_smear_opt_q.boost_scal or 1.)}))  -- sic!opposite boost
+  debug_mem_print(cfg_key, "mem_sample.0") --**
+
+  -- XXX Fa-,Fq-props are computed separately (due to opposite boost)
+  local prop_Fq_list, prop_Fa_list  = {}, {}
+  local propgrp_Fq, propgrp_Fa      = L:DiracPropagator(), L:DiracPropagator()
+  for i_csrc, csrc in ipairs(csrcgrp) do
+    -- quark src, frwprop
+    tt = timer('prop_Fq')
+    local src_F_q = smfunc_ksrc_q(make_source_point(L, csrc))     ; tt('src')
+    printf("norm(src_F_q) = %e\n", src_F_q:norm2())
+    local prop_Fq = solver_func(src_F_q)                          ; tt('done')
+--    prop_Fq_list[i_csrc]  = prop_Fq
+    csrc_hslab[i_csrc]:where(function()propgrp_Fq:set(prop_Fq)end)
+    -- antiquark src, frwprop (gamma5-conjugated)
+    tt = timer('prop_Fa')
+    local src_F_a = smfunc_ksrc_a(make_source_point(L, csrc))     ; tt('src')
+    local prop_Fa = solver_func(src_F_a)                          ; tt('done')
+--    prop_Fa_list[i_csrc]  = prop_Fa
+    csrc_hslab[i_csrc]:where(function()propgrp_Fa:set(prop_Fa)end)
+  end -- csrc
+  force_gc("1")
+  debug_mem_print(cfg_key, "mem_sample.1") --**
+
+  -- smeared prop with ksrc==ksnk
+  tt = timer('prop_Fq_smear')
+  local propgrp_Fq_sm_symm  = smfunc_ksrc_q(propgrp_Fq)           ; tt('done')
+  print_latvec_cmp(propgrp_Fq_sm_symm, propgrp_Fq, 'Fq<>bsm')
+  tt = timer('prop_Fa_smear')
+  local propgrp_Fa_sm_symm  = smfunc_ksrc_a(propgrp_Fa)           ; tt('done')
+  print_latvec_cmp(propgrp_Fa_sm_symm, propgrp_Fa, 'Fa<>bsm')
+  debug_mem_print(cfg_key, "mem_sample.2") --**
+
+  -- shorthands for transformed meson spin structure matrices
+  local meson_src_mGbar = -gamma{mu=3} * meson_src_G:adjoin() * gamma{mu=3}
+  local meson_src_mGbar_g5adj = gamma{n=15} * meson_src_mGbar:adjoin() * gamma{n=15}
+  local meson_snk_G_g5adj =  gamma{n=15} * meson_snk_G:adjoin() * gamma{n=15}
+
+  local bsm_tag_symm  = string.format('%s_%s', ksrc_tag, ksrc_tag)
+  if (redo_contract.c2pt or redo_contract.c2pt_proton) then
+    -- symmetric smearing c2pt
+    -- TODO save c2pt separately for coh.sources (and smear too) to have full extend of t
+    --      OR put csrcgrp_str label on datafile
+    local c2pt_file = get_c2pt_file_tag(cfg_key, csrcgrp, ama, bsm_tag_symm)
+    -- c2pt_file = c2pt_file .. backend_qpdf_cntr
+    printf("[save_c2pt] %s\n", c2pt_file)
+    os.mkdir_path(dirname(c2pt_file))
+    local aff_c2pt = qcd.aff.Writer(c2pt_file)
+    local tt 
+    local mpopt = { csrc=csrc_coh0, mom_list=c2pt_symm_psnk_list,  t_axis=t_axis, ft_sign=-1 }
+    if (redo_contract.c2pt) then    
+      -- XXX coherent samples with spatial(csrc) != spatial(csrc_coh0) need phase correction
+      tt = timer('c2pt_meson_symm')
+      qcd.contract_('meson_F_hB', { propgrp_Fq, propgrp_Fa }, 
+          { save = { file=aff_c2pt, kpath='/c2pt/SP', fkey='meson_g', mkey='P' },
+            momproj = table_join(mpopt, {bc_t=bc_meson_t}) })     ; tt('done')
+      tt = timer('c2pt_meson_symm')
+      qcd.contract_('meson_F_hB', { propgrp_Fq_sm_symm, propgrp_Fa_sm_symm }, 
+          { save = { file=aff_c2pt, kpath='/c2pt/SS', fkey='meson_g', mkey='P' },
+            momproj = table_join(mpopt, {bc_t=bc_meson_t}) })     ; tt('done')
+    end
+    if (redo_contract.c2pt_proton) then
+      tt = timer('c2pt_nucleon_symm')
+      qcd.contract_('baryon_sigma_UUS', 
+          { propgrp_Fq, propgrp_Fq, propgrp_Fq, proton_snk_S, proton_src_S }, 
+          { save = { file=aff_c2pt, kpath='/c2pt/SP', fkey='proton_Tg', mkey='P' },
+            momproj = table_join(mpopt, {bc_t=bc_baryon_t}) })    ; tt('done')
+      tt = timer('c2pt_nucleon_symm')
+      qcd.contract_('baryon_sigma_UUS', 
+          { propgrp_Fq_sm_symm, propgrp_Fq_sm_symm, propgrp_Fq_sm_symm, proton_snk_S, proton_src_S }, 
+          { save = { file=aff_c2pt, kpath='/c2pt/SS', fkey='proton_Tg', mkey='P' },
+            momproj = table_join(mpopt, {bc_t=bc_baryon_t}) })     ; tt('done')
+    end
+    aff_c2pt:close()
+  end
+  debug_mem_print(cfg_key, "mem_sample.3") --**
+
+
+  -- DA contraction test (based on the c3pt code)
+  if (redo_contract.da_meson) then
+    
+    for gf_tag, gf in pairs(gf_lpath_) do
+
+      local da_tag = ksrc_tag
+      if '' ~= gf_tag then da_tag = string.format("%s_%s", da_tag, gf_tag) end
+
+      local gf2 = gf
+      local propgrp2_Fq = propgrp_Fq
+      local propgrp2_Fa = propgrp_Fa
+      if gg then 
+        da_tag = string.format("%s_%s", da_tag, 'gg')
+        gf2 = gauge_transform_U(gg, gf2) 
+        propgrp2_Fq = gg * propgrp_Fq * L:ColorMatrix(gg[csrc_coh0]):adjoin()
+        propgrp2_Fa = gg * propgrp_Fa * L:ColorMatrix(gg[csrc_coh0]):adjoin()
+      end
+
+      tt = timer('contract_da_meson')
+      local da_meson_file = get_da_file_tag(cfg_key, csrcgrp, ama, da_tag)
+      printf("[save_da_meson] %s\n", da_meson_file)
+      os.mkdir_path(dirname(da_meson_file))
+      local aff_da = qcd.aff.Writer(da_meson_file)
+
+      local kpath = string.format("/da/SP/meson/%s", csrcgrp_key)
+      
+      if(backend_qpdf_cntr == 'gpu-quda') then
+        local da_quda_opt = {
+           backend = backend_qpdf_cntr,
+           preserve_basis = qpdfQuda_preserveBasis,
+           dump_momproj = qpdfQuda_dumpMom,
+           result = qpdfQuda_pushResult,            -- should be false or nil/omitted, otherwise GPU will export full field data back to CPU but you need only mom.projected data
+           qdp2quda = qpdfQuda_convQdp2Quda,
+           verbosity = qpdfQuda_qVerbosity,
+           save = {
+              kpath=kpath,
+              mkey='q', fkey='g', file=aff_da },
+              momproj = {
+                 csrc=csrc_coh0,                    -- same as for c2pt
+                 mom_list=da_psnk_list,
+                 t_axis=t_axis,
+                 bc_t = bc_meson_t,                 -- same as for c2pt
+                 --tlen=da_lt_chop,                 -- save full Lt by default
+                 ft_sign = -1 }                     -- same as for c2pt
+        }
+
+       local mG_propgrp2_Fa_g5adj = meson_src_mGbar * gamma{n=15} * propgrp2_Fa:adjoin() * gamma{n=15}
+       local qudaQCS = qcd.contract_state(
+                  qpdfQuda_cntrString, { propgrp2_Fq, mG_propgrp2_Fa_g5adj, gf2 }, da_quda_opt)
+               printf("qudaQCS = '%s'\n", tostring(qudaQCS))
+
+       print_obj(wlink_pdf_spec_list,'da_path_list')
+
+       c_iter_qpdf_lpspec(wlink_pdf_spec_list,
+                        function(bv)
+                          printf("iter_qpdf_lpspec[%s]\n", bv)
+                          local qudaRes = qudaQCS:step(bv)
+                          printf("\n\n")
+                          -- return qudaQCS:step(bv)
+                          return qudaRes
+                        end
+        )
+       aff_da:close()
+       qudaQCS = nil ; force_gc("qudaQCS")
+
+      else
+        error(string.format("bad contract_bkend='%s'", backend_qpdf_cntr))
+      end
+
+    tt('done')
+    end -- for gf_tag, gf_lpath_chop
+  end -- redo_contract.da
+
+
+
+  -- TMDWF contraction test (based on the c3pt code)
+  if (redo_contract.tmdwf_meson) then
+
+    local tmdwf_psnk_list = {}
+    for i_psnk, snk_spec in pairs(c3pt_snk_spec_list) do
+       local snk_smear_opt_q, c2pt_skew_psnk_list, c3pt_psnk, c3pt_qext_list = unpack(snk_spec)
+       table.insert(tmdwf_psnk_list, c3pt_psnk)
+    end
+
+    for gf_tag, gf in pairs(gf_lpath_) do
+
+      local tmdwf_tag = ksrc_tag
+      if '' ~= gf_tag then tmdwf_tag = string.format("%s_%s", tmdwf_tag, gf_tag) end
+
+      local gf2 = gf
+      local propgrp2_Fq = propgrp_Fq
+      local propgrp2_Fa = propgrp_Fa
+      if gg then
+        tmdwf_tag = string.format("%s_%s", tmdwf_tag, 'gg')
+        gf2 = gauge_transform_U(gg, gf2)
+        propgrp2_Fq = gg * propgrp_Fq * L:ColorMatrix(gg[csrc_coh0]):adjoin()
+        propgrp2_Fa = gg * propgrp_Fa * L:ColorMatrix(gg[csrc_coh0]):adjoin()
+      end
+
+      tt = timer('contract_tmdwf_meson')
+      tmdwf_tag = string.format("%s_%s", tmdwf_tag, "tmdwf")
+      local tmdwf_meson_file = get_tmdwf_file_tag(cfg_key, csrcgrp, ama, tmdwf_tag)
+      printf("[save_tmdwf_meson] %s\n", tmdwf_meson_file)
+      os.mkdir_path(dirname(tmdwf_meson_file))
+      local aff_tmdwf = qcd.aff.Writer(tmdwf_meson_file)
+
+      local kpath = string.format("/tmdwf/SP/meson/%s", csrcgrp_key)
+
+      if(backend_qpdf_cntr == 'gpu-quda') then
+        local tmdwf_quda_opt = {
+           backend = backend_qpdf_cntr,
+           preserve_basis = qpdfQuda_preserveBasis,
+           dump_momproj = qpdfQuda_dumpMom,
+           result = qpdfQuda_pushResult,            -- should be false or nil/omitted, otherwise GPU will export full field data back to CPU but you need only mom.projected data
+           qdp2quda = qpdfQuda_convQdp2Quda,
+           verbosity = qpdfQuda_qVerbosity,
+           save = {
+              kpath=kpath,
+              mkey='q', fkey='g', file=aff_tmdwf },
+              momproj = {
+                 csrc=csrc_coh0,                    -- same as for c2pt
+                 mom_list=tmdwf_psnk_list,
+                 t_axis=t_axis,
+                 bc_t = bc_meson_t,                 -- same as for c2pt
+                 ft_sign = -1 }                     -- same as for c2pt
+        }
+
+       local mG_propgrp2_Fa_g5adj = meson_src_mGbar * gamma{n=15} * propgrp2_Fa:adjoin() * gamma{n=15}
+       x_iter_tmd_lpspec(wlink_tmd_spec_list, propgrp2_Fq, mG_propgrp2_Fa_g5adj, gf2, tmdwf_quda_opt)
+
+       aff_tmdwf:close()
+
+      else
+        error(string.format("bad contract_bkend='%s'", backend_qpdf_cntr))
+      end
+
+    tt('done')
+    end -- for gf_tag, gf_lpath_chop
+  end -- redo_contract.tmdwf
+
+  -- C3pt contraction
+  --tt=timer('propgrp_Fq_chop')
+  for i_psnk, snk_spec in pairs(c3pt_snk_spec_list) do
+    local snk_smear_opt_q, c2pt_skew_psnk_list, c3pt_psnk, c3pt_qext_list = unpack(snk_spec)
+    -- smearing with pos and neg boost at sink
+
+    local ksnk_tag = snk_smear_opt_q.tag
+    local bsm_tag_skew = string.format('%s_%s', ksrc_tag, ksnk_tag)
+    local smfunc_ksnk_q = make_smear_func(L, snk_smear_opt_q)
+    local smfunc_ksnk_a = make_smear_func(L, table_join(snk_smear_opt_q,
+          {boost_scal=-1*(snk_smear_opt_q.boost_scal or 1.)}))  -- sic!opposite boost
+
+
+
+    -- with this function one can exchange Fq, Fa
+    local function  do_c3pt(propgrp_Fq, propgrp_Fq_sm_symm, smfunc_ksnk_q,
+                            propgrp_Fa, propgrp_Fa_sm_symm, smfunc_ksnk_a,
+                            bsm_tag_symm, bsm_tag_skew,
+                            c2pt_skew_psnk_list, c3pt_psnk, c3pt_qext_list)
+      local tt
+      tt = timer('propgrp_Fq_chop')
+      -- for qbarq contractions
+      local propgrp_Fq_chop = qpdf_chop_map(propgrp_Fq)               ; tt('done')
+      if gg then propgrp_Fq_chop = qpdf_chop_map(gg * propgrp_Fq * L:ColorMatrix(gg[csrc_coh0]):adjoin()) end    --**
+
+      -- smeared prop for ksnk!=ksrc (recalc only if necessary)
+      local propgrp_Fq_sm_skew, propgrp_Fa_sm_skew
+      -- XXX table_equal may be "false negative" and enforce smear and c2pt for skew bsm
+      if bsm_tag_skew == bsm_tag_symm then  -- boost@src == boost@snk; reuse smeared props
+        propgrp_Fq_sm_skew = propgrp_Fq_sm_symm
+        propgrp_Fa_sm_skew = propgrp_Fa_sm_symm
+      else -- boost@src != boost@snk
+        -- smear props for sink separately
+        propgrp_Fq_sm_skew = smfunc_ksnk_q(propgrp_Fq)
+        propgrp_Fa_sm_skew = smfunc_ksnk_a(propgrp_Fa)
+        -- save into separate files (guaranteed by the bsm_tag_skew)
+        if (((redo_contract.c2pt or redo_contract.c2pt_proton))
+            and 0 < #c2pt_skew_psnk_list) then
+          -- skew-symmetric smearing c2pt
+          local c2pt_file = get_c2pt_file_tag(cfg_key, csrcgrp, ama, bsm_tag_skew)
+          printf("[save_c2pt] %s\n", c2pt_file)
+          os.mkdir_path(dirname(c2pt_file))
+          local aff_c2pt = qcd.aff.Writer(c2pt_file)
+          local mpopt = { csrc=csrc_coh0, mom_list=c2pt_skew_psnk_list,  t_axis=t_axis, ft_sign=-1 }
+          if (redo_contract.c2pt) then
+            tt = timer('c2pt_meson_skew')
+            qcd.contract_('meson_F_hB', { propgrp_Fq_sm_symm, propgrp_Fa_sm_symm },
+                { save = { file=aff_c2pt, kpath='/c2pt/SS', fkey='meson_g', mkey='P' },
+                  momproj = table_join(mpopt, {bc_t=bc_meson_t}) })     ; tt('done')
+          end
+          if (redo_contract.c2pt_proton) then
+            tt = timer('c2pt_nucleon_skew')
+            qcd.contract_('baryon_sigma_UUS',
+                { propgrp_Fq_sm_skew, propgrp_Fq_sm_skew, propgrp_Fq_sm_skew, proton_snk_S, proton_src_S },
+                { save = { file=aff_c2pt, kpath='/c2pt/SS', fkey='proton_Tg', mkey='P' },
+                  momproj = table_join(mpopt, {bc_t=bc_baryon_t}) })    ; tt('done')
+
+          end
+          aff_c2pt:close()
+        end -- redo_contract.c2pt(|proton)
+      end -- bsm_tag_skew != bsm_tag_symm 
+      force_gc("4")
+      debug_mem_print(cfg_key, "mem_sample.4") --**
+
+      tt = timer('srcgrp_Bq')
+      -- TODO restrict smearing to relevant timeslices (all tsep for all csrc)
+      local psnk_mom_ph = L:Complex(0.)
+      for i_csrc, csrc in ipairs(csrcgrp) do
+        csrc_hslab[i_csrc]:where(function()
+            psnk_mom_ph:set(L:planewave(csrc, space2full(c3pt_psnk, t_axis)))end)
+      end
+      local srcgrp_Bq_g5adj_allt = smfunc_ksnk_q(
+                  psnk_mom_ph     -- sic! no conjugation: this is anti-q prop
+                  * (meson_snk_G_g5adj * propgrp_Fa_sm_skew * meson_src_mGbar_g5adj)) ; tt('done')
+      debug_mem_print(cfg_key, "mem_sample.5") --**
+
+      for i_tsep, tsep in pairs(tsep_list) do
+        assert(tsep < hslab_len_t)
+        tt = timer('propgrp_Bq')
+        local srcgrp_Bq_g5adj  = L:DiracPropagator()
+        for i_csrc, csrc in ipairs(csrcgrp) do
+          local tsrc = csrc[1+t_axis]
+          local tsnk = (tsrc + tsep) % lt
+          L:Subset({axis=t_axis, position=tsnk}):where(function()
+              srcgrp_Bq_g5adj:set(srcgrp_Bq_g5adj_allt) end)    -- sic! no bc factor because bc_t_u == bc_t_d
+        end
+        debug_mem_print(cfg_key, "mem_sample.6") --**
+        local propgrp_Bq_g5adj = solver_func(srcgrp_Bq_g5adj)
+        if true then
+  --      if false then 
+          -- test bkwprop against c2pt (works only for independent backward props!)
+          local propgrp_Bq_g5adj_sm = smfunc_ksrc_q(propgrp_Bq_g5adj)
+          local bkwtr = propgrp_Bq_g5adj_sm:adjoin():trace()
+          for i_csrc, csrc in ipairs(csrcgrp) do
+            printf("c2pt[c0=%s,dt=%d]=(%+13.8e,%+13.8e)\n",
+                strkey.csrc_str(csrc), tsep, bkwtr[csrc]:real(), bkwtr[csrc]:imag())
+          end
+        end
+
+        local propgrp_Bq = gamma{n=15} * propgrp_Bq_g5adj:adjoin() * gamma{n=15}        ; tt('done')
+        tt = timer('propgrp_Bq_chop')
+        local propgrp_Bq_chop = qpdf_chop_map(propgrp_Bq)                               ; tt('done')
+        if gg then propgrp_Bq_chop = qpdf_chop_map(L:ColorMatrix(gg[csrc_coh0]) * propgrp_Bq * gg:adjoin()) end    --**
+        propgrp_Bq, propgrp_Bq_g5adj = nil, nil
+        force_gc("7")
+        debug_mem_print(cfg_key, "mem_sample.7") --**
+
+        if (redo_contract.qpdf) then
+          for gf_tag, gf_lpath_chop in pairs(gf_lpath_chop_list) do
+            tt = timer('contract_qpdf_meson')
+            local qpdf_tag = bsm_tag_skew
+            if '' ~= gf_tag then qpdf_tag = string.format("%s_%s", qpdf_tag, gf_tag) end
+
+            local qpdf_file = get_qpdf_meson_file_tag(cfg_key, csrcgrp, c3pt_psnk, tsep,
+                qpdf_tag, ama)
+            -- qpdf_file = qpdf_file .. backend_qpdf_cntr -- CHARLIE
+            printf("[save_qpdf] %s\n", qpdf_file)
+            os.mkdir_path(dirname(qpdf_file))
+            local aff_qpdf = qcd.aff.Writer(qpdf_file)
+
+            local this_snk_str = strkey.snk_str_k(c3pt_psnk, tsep)
+            local kpath = string.format("/qpdf/SS/meson/%s/%s", csrcgrp_key, this_snk_str)
+
+            if(backend_qpdf_cntr == 'gpu-quda') then
+               local qpdf_quda_opt = {
+                  backend = backend_qpdf_cntr,
+                  preserve_basis = qpdfQuda_preserveBasis,
+                  dump_momproj = qpdfQuda_dumpMom,
+                  result = qpdfQuda_pushResult,
+                  qdp2quda = qpdfQuda_convQdp2Quda,
+                  verbosity = qpdfQuda_qVerbosity,
+                  save = {
+                     kpath=kpath,
+                     mkey='q', fkey='g', file=aff_qpdf },
+                  momproj = {
+                     csrc=csrc_chop0,
+                     mom_list=c3pt_qext_list,
+                     t_axis=t_axis,
+                     bc_t = qpdfQuda_c3pt_bCond,
+                     tlen=lt_chop,
+                     ft_sign = qpdfQuda_c3pt_FT_sign }
+               }
+
+               local qudaQCS = qcd.contract_state(
+                  qpdfQuda_cntrString, { propgrp_Fq_chop, propgrp_Bq_chop, gf_lpath_chop }, qpdf_quda_opt)
+               printf("qudaQCS = '%s'\n", tostring(qudaQCS))
+
+               print_obj(wlink_pdf_spec_list,'qpdf_path_list')
+
+               c_iter_qpdf_lpspec(wlink_pdf_spec_list,
+                                function(bv)
+                                   printf("iter_qpdf_lpspec[%s]\n", bv)
+                                   local qudaRes = qudaQCS:step(bv)
+                                   printf("\n\n")
+                                   -- return qudaQCS:step(bv)
+                                   return qudaRes
+                                end
+               )
+               aff_qpdf:close()
+               qudaQCS = nil ; force_gc("qudaQCS")
+            elseif (backend_qpdf_cntr == 'cpu') then
+               general_save_qpdf_qbarq(aff_qpdf, kpath,
+                                       propgrp_Fq_chop, propgrp_Bq_chop,     -- sic! Tr[Bq . Gamma_n . Fq]
+                                       gf_lpath_chop,
+                                       csrc_chop0, lt_chop, wlink_pdf_spec_list,
+                                       c3pt_qext_list, t_axis, ferm_bc)
+               aff_qpdf:close()
+            else
+               error(string.format("bad contract_bkend='%s'", backend_qpdf_cntr))
+            end
+
+
+            debug_mem_print(cfg_key, "mem_sample.8") --**
+
+            tt('done')
+          end -- for gf_tag, gf_lpath_chop
+        end -- redo_contract.qpdf
+      end -- for tsep
+    end -- function do_c3pt
+
+
+    -- call pos  
+    do_c3pt(propgrp_Fq, propgrp_Fq_sm_symm, smfunc_ksnk_q,
+            propgrp_Fa, propgrp_Fa_sm_symm, smfunc_ksnk_a,
+            bsm_tag_symm, bsm_tag_skew,
+            c2pt_skew_psnk_list, c3pt_psnk, c3pt_qext_list)
+
+    -- call neg  
+    -- if redo_contract.qpdf_neg then
+    --   do_c3pt(propgrp_Fa, propgrp_Fa_sm_symm, smfunc_ksnk_a,
+    --           propgrp_Fq, propgrp_Fq_sm_symm, smfunc_ksnk_q,
+    --           bsm_tag_symm .. '_neg', bsm_tag_skew .. '_neg', 
+    --           latvec_scal_left(-1, c2pt_skew_psnk_list), 
+    --           latvec_scal_left(-1, c3pt_psnk), 
+    --           latvec_scal_left(-1, c3pt_qext_list))
+    -- end
+
+  end -- for i_psnk, snk_spec 
+
+  force_gc("sample_meson_qpdf")
+  timer_1srcgrp('done')
+end
+
