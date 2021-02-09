@@ -1,0 +1,306 @@
+package.path = 'qlua-production/?.qlua;qlib-lhpc/?.qlua;qlib/?.qlua;' .. package.path
+require 'strict'    -- catch all undefined (nil) variables
+require 'stdlib'    -- standard printf, etc
+require 'lhpc-std'  -- make_source, etc
+require 'ape-smear' -- gauge smear
+require 'hex-smear'
+require 'gauge'
+require 'qdpc_io'
+require 'setup_util'
+require 'debug_util'
+require 'latvec'
+
+require 'hadspec'
+
+require 'util/file'
+require 'util/geom'
+require 'util/strkey'
+
+
+----------------------- Begin subroutines----------------------------------
+function sample_log_file(cfg_key)
+  return string.format("%s/sample_log/%s.hyp%d.npr", data_top, cfg_key, hyp_ind)
+end
+function have_sample(cfg_key, sample_tag)
+  return log_have_tag(sample_log_file(cfg_key), sample_tag)
+end   
+function done_sample(cfg_key, sample_tag)
+  return log_done_tag(sample_log_file(cfg_key), sample_tag)
+end     
+--[[
+function sample_log_file(cfg_key)
+  return string.format("%s/sample_log/%s.npr", data_top, cfg_key)
+end
+--]]
+
+--- compute a straight Wilson line
+local function straight_wilsonline(W, U, dir, dsign, dz)
+  -- produce Wilson line W[x] = U[x,mu]*U[x+muhat,mu]*...*U[x+(dz-1)*muhat,mu] * W[x+dz*muhat]
+  local Wout = W
+  for z = 1, dz do
+    if 1 == dsign then
+      Wout = U[1+dir] * Wout:shift(dir, "from_forward")
+    elseif -1 == dsign then
+      Wout = (U[1+dir]:adjoin() * Wout):shift(dir, "from_backward")
+    else error(string.format("bad dsign='%s'"), tostring(dsign)) end
+  end
+  return Wout
+end
+
+local function save_prop_momproj(p, mom, csrc0)
+  local L       = p.lattice
+  local pw_conj = L:planewave(csrc0, mom):conj()
+  local nc      = p:colors()
+  local ns      = 4
+  local v       = vector.complex(144)
+  for jc = 0, nc-1 do for js = 0, ns-1 do
+    local df_j = p[{c=jc, d=js}]
+    for ic = 0, nc-1 do for is = 0, ns-1 do
+      local c = df_j[{c=ic, d=is}]
+      v[is + ns * (ic + nc * (js + ns *jc))] = (c * pw_conj):sum()
+    end end
+  end end
+  return v
+end
+
+-- create point source
+local function make_mom_source_dp(L, mom, csrc0)
+   local dp  = L:DiracPropagator()
+   local nc  = 3
+   local ns  = 4
+   local pw = L:planewave(csrc0, mom)
+   for jc = 0, nc-1 do for js = 0, ns-1 do
+       local df_j = L:DiracFermion()
+       df_j[{c=jc, d=js}] = pw
+       dp[{c=jc, d=js}] = df_j
+   end end
+   return dp
+end
+
+local function save_nprcontract_all(qfrw, qbck, quarkmom, qpdfmom, csrc, aff_w)
+  local tt = timer("nprcontract")
+  local gname
+  local m_qpdfmom = {}
+  
+  local qpdf_w_f = save_prop_momproj(qfrw, quarkmom, csrc)
+
+  -- save qpdf_w_f to file 
+  aff_w:mkpath('WF')
+  aff_w:write('WF', qpdf_w_f)
+
+  for mu = 0, #L - 1 do m_qpdfmom[1+mu] = -qpdfmom[1+mu] end  --- to take care of conjugation in save_prop_momproj
+
+  local qbck_g5adj = gamma{n=15} * qbck:adjoin() * gamma{n=15}
+  for ng = 0, 15 do
+    local qpdf_b_g_w_f = save_prop_momproj(
+        qbck_g5adj * gamma{n=ng} * qfrw,
+        m_qpdfmom, csrc)
+     
+    -- save to file 
+    gname = string.format('G%d',ng)
+    aff_w:mkpath(gname)
+    aff_w:write(gname, qpdf_b_g_w_f)
+  end
+--  aff_w:flush()
+  tt("done")
+end
+
+
+--- main subroutine to compute <\psibar(p,x) W(x,y) \Gamma \psi(y)>
+local function scan_rimom_contract(L,  
+                             U,         --- gauge field to compute Wilson line
+                             qfrw,      --- forward quark propagator G(x,P)
+                             qbck,      --- backward quark propagator G(x,P)
+                             quarkmom,  --- quark momentum
+                             qpdfmom,   --- qpdf momentum insertion
+                             csrc, 
+                             dir,       --- Direction of Wilson line 
+                             zmin, zmax,  --- z \in (zmin, zmax), zmin >= 0
+                             aff_w
+                             )
+  local zskip = 1
+
+  local qfrw_new = qfrw
+  local zprev = 0
+  for z = zmin, zmax, zskip do
+    -- qfrw_new[x] = W[x,x+z*muhat] * qfrw[x+z*muhat]
+    aff_w:mkpath('/QPDF')
+    aff_w:chpath(string.format('/QPDF/Zp%d_%d',dir, z))
+    -- Use WL of length z-zskip to get WL of length z
+    qfrw_new = straight_wilsonline(qfrw_new, U, dir, 1, z - zprev)    
+    zprev = z
+    save_nprcontract_all(qfrw_new, qbck, quarkmom, qpdfmom, csrc, aff_w)
+  end
+  
+  local zmin2 = zmin
+  if 0 == zmin2 then zmin2 = zskip end
+  qfrw_new = qfrw
+  zprev = 0
+  for z = zmin, zmax, zskip do
+    -- qfrw_new[x] = W[x,x-z*muhat] * qfrw[x-z*muhat]
+    aff_w:chpath(string.format('/QPDF/Zm%d_%d',dir, z))
+    -- Use WL of length z-zskip to get WL of length z
+    qfrw_new = straight_wilsonline(qfrw_new, U, dir, -1, z - zprev)    
+    zprev = z
+    save_nprcontract_all(qfrw_new, qbck, quarkmom, qpdfmom, csrc, aff_w)
+  end
+end
+
+
+
+------------------------------ CONFIG -----------------------------
+
+local quarkmom_list = {
+  -- quarkmom, qpdfmom
+   { {5,5,5,0}, {0,0,0,0} },
+   { {5,5,5,5}, {0,0,0,0} },
+
+   { {6,6,6,0}, {0,0,0,0} },
+   { {6,6,6,6}, {0,0,0,0} },
+
+   { {7,7,7,0}, {0,0,0,0} },
+   { {7,7,7,7}, {0,0,0,0} },
+
+--}
+--[[
+local quarkmom_list = {
+{ {3,3,3,4}, {0,0,0,0} },
+{ {3,3,3,5}, {0,0,0,0} },
+{ {3,3,3,6}, {0,0,0,0} },
+{ {4,4,4,4}, {0,0,0,0} },
+{ {4,4,4,5}, {0,0,0,0} },
+{ {4,4,4,6}, {0,0,0,0} },
+{ {5,5,5,4}, {0,0,0,0} },
+{ {5,5,5,5}, {0,0,0,0} },
+{ {5,5,5,6}, {0,0,0,0} },
+{ {6,6,6,4}, {0,0,0,0} },
+{ {6,6,6,5}, {0,0,0,0} },
+{ {6,6,6,6}, {0,0,0,0} },
+{ {7,7,7,4}, {0,0,0,0} },
+{ {7,7,7,5}, {0,0,0,0} },
+{ {7,7,7,6}, {0,0,0,0} },
+{ {8,8,8,4}, {0,0,0,0} },
+{ {8,8,8,5}, {0,0,0,0} },
+{ {8,8,8,6}, {0,0,0,0} },
+{ {9,9,9,4}, {0,0,0,0} },
+{ {9,9,9,5}, {0,0,0,0} },
+{ {9,9,9,6}, {0,0,0,0} },
+{ {10,10,10,4}, {0,0,0,0} },
+{ {10,10,10,5}, {0,0,0,0} },
+{ {10,10,10,6}, {0,0,0,0} }
+}
+--]]
+local csrc0 = {0,0,0,0}
+
+local wline_dir = 3                                 --- Wilson line direction
+local zmn = 0
+local zmx = 0 -- 32
+
+--------------- initialization for npr
+
+local amanpr = ama_list[1];  ---- scan over ama?
+
+---------------- aff stuff
+
+function samplename_str(p,q)
+  return string.format("PX%dPY%dPZ%dPT%d_QX%dQY%dQZ%dQT%d", p[1], p[2], p[3], p[4], q[1], q[2], q[3], q[4])
+end
+
+function qrkmom_str(p)
+  return string.format("PX%dPY%dPZ%dPT%d", p[1], p[2], p[3], p[4])
+end
+
+function qpdfmom_str(p)
+  return string.format("QX%dQY%dQZ%dQT%d", p[1], p[2], p[3], p[4])
+end
+
+
+
+--------------- main stuff
+
+local job_timer = timer('total')
+local curtimer
+local sample_timer
+
+local gauge_u_bc = gauge_copy(gauge_u)
+local gauge_u_hyp_bc = gauge_copy(gauge_u_hyp)
+
+if (hyp_ind == 1) then
+   gauge_apply_boundary(gauge_u_hyp_bc, ferm_bc)   -- XXX check name in qlib/gauge.qlua
+elseif (hyp_ind == 0) then
+   gauge_apply_boundary(gauge_u_bc, ferm_bc)   -- XXX check name in qlib/gauge.qlua
+else
+   print("Bad hyp_ind ", hyp_ind)
+   os.exit(1)
+end
+
+-- init solver stuff --
+local amanpr = ama_list[1];  ---- scan over ama?
+
+local solve = make_solver(amanpr)
+-- begin npr code --
+floc = {l_64c64='fine_npr'}
+for i_mom, quark_qpdf_mom in pairs(quarkmom_list) do
+  local quarkmom, qpdfmom = unpack(quark_qpdf_mom)
+  local aquarkmom  = {}
+  local qpdfmom_bool = false
+  for mu = 0, #L-1 do 
+    aquarkmom[1+mu] = quarkmom[1+mu] + qpdfmom[1+mu] 
+    if 0 ~= qpdfmom[1+mu] then qpdfmom_bool = true end
+  end
+
+  local sample_tag = samplename_str(quarkmom, qpdfmom)
+
+  if have_sample(cfg_key, sample_tag) then
+      printf("INFO: SKIP %s: done\n", sample_tag)
+  else
+      sample_timer = timer('begin sample') 
+
+      local aff_filename = string.format("%s/%s/new_npr_%s_%s_%s_%s_%s_hyp%d.aff",
+      data_top, floc[lsize], cfg_key, mq_tag, qrkmom_str(quarkmom), qpdfmom_str(qpdfmom), ama_str(amanpr), hyp_ind)
+      curtimer = timer('open aff file')
+      local aff_wr = qcd.aff.Writer(aff_filename)
+      curtimer('done')
+
+      curtimer = timer('frw src')
+      local qsource = make_mom_source_dp(L, quarkmom, csrc0)   --- Get plane wave source
+      curtimer('done')
+      curtimer = timer('frw solve')
+      local qprop_frw_xP = solve(qsource)                      --- Invert Dslash on plane wave source to get G(x,P)
+      curtimer('done')
+      curtimer = timer('frw save_prop_momproj')
+      local qprop_frw_PP = save_prop_momproj(qprop_frw_xP, quarkmom, csrc0)     --- compute 12x12 matrix G(P,P) for external quark-leg amputation
+      curtimer('done')
+      aff_wr:mkpath('/FPP')                   ------------ store forward prop
+      curtimer = timer('write FPP')
+      aff_wr:write('/FPP',qprop_frw_PP) 
+      curtimer('done')
+  
+      curtimer = timer('BPP')
+      local qprop_bck_xP = nil
+      if not qpdfmom_bool then 
+         qprop_bck_xP = qprop_frw_xP
+      else
+         local qsource = make_mom_source_dp(L, aquarkmom, csrc0) 
+         qprop_bck_xP = solve(qsource)
+         local qprop_bck_PP=  save_prop_momproj(qprop_bck_xP, aquarkmom, csrc0)
+         aff_wr:mkpath('/BPP')                   ------------ store backward prop
+         aff_wr:write('/BPP',qprop_bck_PP)
+      end
+      curtimer('done')
+
+      curtimer = timer('scan_rimom_contract')
+      local solutions = scan_rimom_contract(L, 
+	      gauge_u_hyp_bc, qprop_frw_xP, qprop_bck_xP, 
+	      quarkmom, qpdfmom, csrc0, wline_dir, zmn, zmx, aff_wr)    --- Contract the external quark field with qPDF operator
+      curtimer('done')
+
+      aff_wr:close()
+      sample_timer('done')
+      done_sample(cfg_key, sample_tag)
+  end
+end
+
+qcd.qprof_print()
+job_timer('done')
+printf('QLUA_RUN_SUCCESS\n')

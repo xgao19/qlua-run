@@ -1,0 +1,620 @@
+package.path = 'qlib/?.qlua;qlib-lhpc/?.qlua;qlua-production/?.qlua;' .. package.path
+require 'strict'
+require 'setup_util'
+require "debug_util"
+require 'latvec'
+require 'stdlib'
+
+require "ape-smear" -- gauge smear
+require "hex-smear"
+require "gauge_smear" -- my file :)
+
+require 'util/strkey'
+require 'lhpc-std'
+require 'qdpc_io'
+require 'rcparams'
+
+rcparams.backend.dslash_solver = 'gpu-quda-mg'
+rcparams.backend.laplacian = 'gpu-quda'
+rcparams.backend.qbarq = 'gpu-quda'
+
+print_obj(rcparams, 'rcparams')
+
+printf("package.path - config.qlua: %s\n", package.path)
+
+-- XXX NOTES
+-- * compute pion 2pt functions for the entire time extent (without the coherent trick)
+-- * before running, make sure that directories and links are set
+--   $ mkdir data/hadspec data_pdir/{frw_prop,prop_log}
+--   qlib -> $QLUADIR/qlib 
+--   qlib-lhpc -> $QLUADIR/lhpc
+--   file 'cfg.list.all' : permanent list of configurations (all, not only the ones analyzed) 
+--     : it is used to compute the source grid displacements on every lattice
+
+-------------------------------------------------------------------------------
+-- general
+-------------------------------------------------------------------------------
+assert(job_key)
+cfg_key = job_key -- job# enumerates config#
+
+latsize   = {64,64,64,64}-- {48,48,48,64}
+-- latsize = {48,48,48,64}
+network_geom = {2,2,2,4}
+t_axis    = #latsize - 1
+rnd_seed  = 1984
+
+contract_only = false -- stub
+if contract_only then printf("*** CONTRACT_ONLY ***\n") end
+
+------------------------------------------------------------------------------
+-- INITIALIZATION
+------------------------------------------------------------------------------
+L = qcd.lattice(latsize, {network=network_geom})
+S = rnd_init(L, rnd_seed)
+
+
+-------------------------------------------------------------------------------
+-- quark action
+-------------------------------------------------------------------------------
+-- TODO add gauge smearing params
+-- * fermion params
+ferm_bc = {1,1,1,1}
+c_sw = 1.0372
+mq_tag, mq_l = "hyp1q049", -0.049
+
+
+
+-- kappa_l =  1./2./(4. + mq_l)
+kappa_l = 1./(2.*(mq_l+4.))
+
+function toSUn(L, X)
+ local Y = (X - X:adjoin()) / 2
+ return (Y - Y:trace() / 3.0 * L:ColorMatrix(complex(1,0))):exp()
+end
+
+function IdentitySUn(L)
+ return L:ColorMatrix(complex(1,0))
+end
+
+function weak_SUn(L, S)
+ return toSUn(L, 0.2 * S:gaussian_ColorMatrix())
+end
+
+--gauge_u = {}
+--for i = 0, #L - 1 do
+--  gauge_u[i+1] =  IdentitySUn(L) -- weak_SUn(L, S)
+--end
+
+
+
+------------------------------------------------------------------------------
+-- file locations
+------------------------------------------------------------------------------
+ens_top   = '.'
+data_top  = 'data_a' 
+data_pdir = 'data_pdir'
+
+prop_qio_stride   = 1
+prop_qio_volfmt   = 'part_dir'
+
+function csrc_str(csrc)
+  return string.format("x%dy%dz%dt%d", csrc[1], csrc[2], csrc[3], csrc[4])
+end
+function snk_str(psnk, tsnk)
+  return string.format("PX%dPY%dPZ%dT%d", psnk[1], psnk[2], psnk[3], tsnk)
+end
+
+-- AMA-dependent output file names
+function ama_str(ama)
+  if 'exact' == ama['approx'] then
+    return string.format("ex")
+  elseif 'sloppy' == ama['approx'] then
+    return string.format("sl")
+  else
+    error(string.format('unknown ama="%s"', ama['approx']))
+  end
+end
+
+------------------------------------------------------------------------------
+-- gauge file
+------------------------------------------------------------------------------
+
+function get_gauge_gfix_file(key, gfix_type)
+  return string.format("%s/gauge_gfix/ckpoint_lat.%s.%s",
+          data_top, gfix_type, key)
+end
+
+--function get_gauge_file(key)
+--  return string.format("%s/gauge/l6464f21b7825m00082m0164a.%s",
+--          ens_top, key)
+--end
+--function get_colmat_gfix_file(key, gfix_type)
+--  return string.format("%s/colmat_gfix/colmat_gfix.%s.%s",
+--          data_top, gfix_type, key)
+--end
+
+------------------------------------------------------------------------------
+-- Read gauge file and smear
+------------------------------------------------------------------------------
+
+--**-----------------------------------------------------------------------------
+--** source smearing **
+--**-----------------------------------------------------------------------------
+ape_alpha   = 2.85
+ape_N       = 25
+ape_accu    = 1e-12
+ape_maxiter = 150
+wup_N       = 40
+wup_alpha   = 3.0
+
+
+gfix_type = 'landau'
+if cfg_key == "free" then
+   printf("cfg_key: %s\n", cfg_key)
+   gauge_u = {}
+   for i=0,#L-1 do
+      gauge_u[i+1] = IdentitySUn(L)
+   end
+else
+   printf("cfg_key: %s\n", cfg_key)
+   gauge_u = load_qdpc_gauge(L, get_gauge_gfix_file(cfg_key, gfix_type))
+end
+
+print_gauge_norm_det(gauge_u, "gauge_u")
+print_gauge_plaquette(gauge_u, "gauge_u")
+
+-- cur_timer("done")
+-- HYP smeared gauge field for solver
+
+cur_timer = timer("gauge_hyp")
+gauge_u_hyp = gauge_hyp_smear_std(gauge_u, 1)
+cur_timer("done")
+print_gauge_norm_det(gauge_u_hyp, "gauge_u_hyp")
+print_gauge_plaquette(gauge_u_hyp, "gauge_u_hyp")
+
+
+-- propagators
+function get_prop_log_file(cfg_key, prop_kind) 
+  return string.format("%s/prop_log/%s.%s",  
+          data_pdir, cfg_key, prop_kind) 
+end
+function get_frwprop_file_tag(key, csrc, ama, sample_tag)
+  return string.format("%s/frw_prop/frw_prop.%s.%s.%s.%s.lime", 
+          data_pdir, key, ama_str(ama), sample_tag, csrc_str(csrc))
+end
+
+-- data output
+function get_hadspec_file_tag(key, csrc, ama, sample_tag)
+  return string.format('%s/hadspec/hadspec.%s.%s.%s.%s.aff',
+          data_top, cfg_key, ama_str(ama), sample_tag, csrc_str(csrc))
+end
+
+
+-------------------------------------------------------------------------------
+-- correlator parameters
+-------------------------------------------------------------------------------
+hadspec_psnk_list = make_mom_list(10)
+hadspec_baryon_list = {"proton_3", "proton_4"}
+
+--    "lambda_2", "delta_2", "proton_3", "lambda_3",
+--    "delta_3", "proton_4", "proton_5", "proton_6",
+--    "lambda_4", "xi_1", "lambda_5", "xi_2", "proton_negpar_3",
+--    "proton_pp", "proton_np", "proton_pp5", "proton_np5"} --]
+
+hadspec_meson_list = {"pion_2","pion_1"}
+
+--    [--"a0_1", "rho_x_1", "rho_y_1", "b1_z_1",
+--    "rho_z_1", "b1_y_1", "b1_x_1", "pion_2",
+--    "a0_2", "rho_x_2", "rho_y_2", "a1_z_1",
+--    "rho_z_2", "a1_y_1", "a1_x_1", "pion_1" } --]
+
+
+do
+  -- * sample coordinates
+--  local cfg_list = {}
+--  for s in io.lines('list.cfg.all') do
+--    cfg_list[1+#cfg_list] = s
+--  end
+--  local cfg_index = table_index(cfg_list, cfg_key)
+--  printf("cfg_key='%s' index=%d\n", cfg_key, cfg_index)
+--  local csrcgrid_sl  = { 1, 1, 1, 1 }
+--  local csrcgrid_ex  = { 1, 1, 1, 1 }
+--  local x0_1= { 0, 0, 0, 0 }
+--  local dx_g= { 1,1,1,1}
+--  local sloppy_csrc_list = make_src_grid(csrcgrid_sl, latsize, x0_1, dx_g, cfg_index)
+--  local exact_csrc_list  = make_src_grid(csrcgrid_ex, latsize, x0_1, dx_g, cfg_index)
+
+  -- * approx modes
+--  ama_list = {
+--    { approx    = 'exact',
+--      csrc_list = exact_csrc_list,
+--      tol       = 1e-9,
+--      prop_prec = 'double' },
+--    { approx    = 'sloppy',
+--      csrc_list = sloppy_csrc_list,
+--      tol       = 1e-4,
+--      prop_prec = 'float' }
+--    }
+  ama_list = {
+    { approx    = 'exact',
+      csrc_list = {{1,1,1,1}},
+      tol       = 1e-10,
+      prop_prec = 'double' },
+    { approx    = 'sloppy',
+      csrc_list = {{1,1,1,1}},
+      tol       = 1e-4,
+      prop_prec = 'float' }
+    }
+end
+
+------------------------------------------------------------------------------
+-- gauge fixing
+------------------------------------------------------------------------------
+gfix_param = {
+  tol     = 1e-8,
+  maxiter = 3000,
+  tol_switch_fletcher = 1e-8, 
+}
+
+
+---- invertor
+------------------------------------------------------------------------------
+--    solver
+------------------------------------------------------------------------------
+-- * QOP-MG parameters
+if 'cpu' == rcparams.backend.dslash_solver then
+   --if false then
+   -- * QOP-MG parameters
+   require 'mg_param'
+   mg_tol_approx = 1e-4
+   mg_maxiter  = 200
+   mg_param_null = {    
+      blocking      = { {3,3,3,2}, {2,2,2,2} },
+      verbose       = {        0,         0  }, 
+      null_vecs     = {       24,        24  },
+      null_vecs_extra={        0,         0  },
+      prehits       = {        0,         0  },
+      posthits      = {        4,         4  },
+      underrelax    = {       1.,        1.  },
+      null_maxiter  = {       20,        20  },
+      null_res      = {      0.4,       0.4  },
+      null_conv     = {      0.8,       0.8  },
+      
+      coarse_res    = {      0.1,       0.1  },
+      coarse_maxiter= {       12,        12  },
+      coarse_ngcr   = {        8,         8  },
+   }
+
+   tt = timer('init_mg')
+   local mg_param = make_mg_params(
+      kappa_l, c_sw, ferm_bc,
+      mg_tol_approx, mg_maxiter, latsize,
+      mg_param_null, { name = "mg", verbose = 0 })
+   print_obj(mg_param, "mg_param")
+   local mg = qcd.qop.WilsonMG(gauge_u_hyp, mg_param)      ; tt('done')
+
+   function make_solver(ama)
+      local scale = 2 * kappa_l
+      if contract_only then return function()end end
+      if ama['approx'] == 'exact' or ama['approx'] == 'sloppy' then
+	 return make_solver_general(function(x)
+	       return (scale * mg:solve(x, {residual = {rsqmin = ama['tol']^2}}))
+	 end)
+      else error(string.format("unknown ama='%s'", ama['approx'])) end
+   end
+elseif 'gpu-quda' == rcparams.backend.dslash_solver then
+   -- * QUDA(-MG) parameters
+   require 'quda'
+   tt = timer('init_quda')
+   qcd.quda.init(L)                                          ; tt('done')
+   local t_boundary
+   if      1 == ferm_bc[1+t_axis] then t_boundary = "PERIODIC"
+   elseif -1 == ferm_bc[1+t_axis] then t_boundary = "ANTI_PERIODIC"
+   else error(string.format("bad ferm_bc_t = '%s'", tostring(ferm_bc[1+t_axis]))) end
+   local QS = nil
+   function make_solver(ama)
+      if contract_only then return function()end end
+      if nil ~= QS then 
+	 QS:close()
+	 QS = nil
+      end
+      QS = qcd.quda.inverter.simple(
+	 -- TODO set sloppy prec->HALF, reliable_delta->0.1
+	 gauge_u_hyp,
+	 { t_boundary          = t_boundary },
+	 { clover_coeff        = c_sw * kappa_l,
+	   dslash_type         = "CLOVER_WILSON",
+	   kappa               = kappa_l,
+	   mass_normalization  = "MASS",
+	   tol                 = ama['tol'],
+	   maxiter             = 10000,
+	   verbosity           = "VERBOSE",
+	   tune                = 'YES',
+      })
+      print_obj(QS, "make_solver")
+      return make_solver_general(function(x) return QS:solve(x) end)
+   end
+elseif 'gpu-quda-mg' == rcparams.backend.dslash_solver then
+  require 'quda'
+   tt = timer('init_quda')
+   qcd.quda.init(L)                    ; tt('done')
+   _quda.setVerbosityQuda("SUMMARIZE")
+
+   local QS = nil
+   function make_solver(ama)
+      if contract_only then return function()end end
+      qudaAPI.printQudaMem()
+      if nil ~= QS then
+         QS:close()
+         QS = nil
+      end
+      force_gc("before create QS")
+      qudaAPI.printQudaMem()
+      local MG_solve_type = "DIRECT_PC"
+      local nMG_level = 3
+
+      local MG_coarse_grid_solution_type
+      if MG_solve_type == "DIRECT" then
+         MG_coarse_grid_solution_type = "MAT"
+      elseif MG_solve_type == "DIRECT_PC" then
+         MG_coarse_grid_solution_type = "MATPC"
+      end
+      local MG_schwarz_type = "INVALID"
+
+      local quda_prec = "DOUBLE"
+      local quda_prec_sloppy = "SINGLE"
+      local quda_prec_precondition = "HALF"
+      local quda_prec_null = "HALF"
+      local quda_halo_prec = "HALF"
+
+      local block_size1 = {4,4,4,4}
+      local block_size2 = {4,4,4,2}
+
+      --- Set Gauge parameters
+      local gauge_params = {
+         type                      = "WILSON",
+         gauge_order               = "QDP",
+         anisotropy                = 1.0,
+         t_boundary                = "ANTI_PERIODIC"
+      };
+      ------------------------------------------------
+      local multrigrid_params = {
+         -- "Global" mg default params
+         setup_type                = "NULL";
+         post_orthonormalize       = "YES";
+         pre_orthonormalize        = "NO";
+         compute_null_vector       = "YES";
+         generate_all_levels       = "YES";
+         run_verify                = "YES";
+         n_level                   = 0;
+         --C.K. New global MG-parameters
+         setup_minimize_memory     = "NO";
+         -- sns 2020/02/12 additions from quda[v1.0.0]
+         run_low_mode_check        = "NO";
+         run_oblique_proj_check    = "NO";
+         coarse_guess              = "NO";
+
+         levels = {
+            {
+               geo_block_size            = block_size1,  -- Block size
+               spin_block_size           = 2,             -- 2 for level 0, 1 afterwards
+               n_vec                     = 24,            -- Number of Null vectors, 24 or 32 usually work well
+               precision_null            = quda_prec_null,        -- Precision to store the Null-space vectors
+               nu_pre                    = 2,             -- Number of pre-smoother applications
+               nu_post                   = 2,             -- Number of post-smoother applications
+               omega                     = 1.00,           -- Over/under relaxation factor for the smoother at each level, 0.8-1.0
+               verbosity                 = "SUMMARIZE",   -- Verbosity on each level of the multigrid
+               setup_inv_type            = "BICGSTAB", --"BICGSTAB",    -- Inverter to use in the setup phase
+               num_setup_iter            = 1,             -- experimental, keep to one for now
+               setup_tol                 = 5e-6,          -- Tolerance to use in the setup phase, usually set to5e-6
+               setup_maxiter             = 3000,           -- Maximum number of iterations for each setup solver, usually set to 500
+               coarse_solver             = "GCR",         -- The solver that wraps around the coarse grid correction and smoother (levels 1+)
+               coarse_solver_tol         = 0.25,          -- Tolerance for the solver that wraps around the coarse grid correction and smoother (levels 1+)
+               coarse_solver_maxiter     = 100,         -- Tolerance for the solver that wraps around the coarse grid correction and smoother (levels 1+)
+               smoother                  = "MR",          -- Smoother to use on each level
+               smoother_tol              = 0.3,          -- Tolerance to use for the smoother / solver on each level
+               smoother_schwarz_type     = MG_schwarz_type, --,"INVALID"    -- Whether to use additive or multiplicative Schwarz preconditioning in the smoother
+               smoother_schwarz_cycle    = 1,
+               smoother_solve_type       = "DIRECT_PC",   -- The type of smoother solve to do on each grid (e/o preconditioning or not)
+               smoother_halo_precision   = quda_halo_prec,
+               coarse_grid_solution_type = MG_coarse_grid_solution_type,       -- The type of residual to send to the next coarse grid, and thus the type of solution to receive back from this coarse grid, if smoother_solve_type == DIRECT_PC then set to MATPC, otherwise to MAT
+               cycle_type                = "RECURSIVE",   -- Set always to "RECURSIVE"
+               global_reduction          = "YES",          -- Whether to use global reductions or not for the smoother / solver at each level - experimental. If smoother_schwarz_type != FALSE, this must be set to NO
+               location                  = "CUDA",        -- MG Solver location
+               setup_location            = "CUDA",        -- Location where each level should be done
+               mu_factor                 = 1.,             -- twisted mass coarse level mu-factor, irrelevant here
+
+               setup_ca_basis              = "POWER_BASIS",
+               setup_ca_basis_size         = 4,
+               setup_ca_lambda_min         = 0.0,
+               setup_ca_lambda_max         = -1.0,
+               coarse_solver_ca_basis      = "POWER_BASIS",
+               coarse_solver_ca_basis_size = 4,
+               coarse_solver_ca_lambda_min = 0.0,
+               coarse_solver_ca_lambda_max = -1.0,
+               -- sns 2020/02/12 additions from quda[v1.0.0]
+               n_block_ortho             = 1,
+               use_eig_solver            = "NO",
+               vec_load                  = "INVALID", -- FIXME FALSE ?
+               vec_store                 = "INVALID", -- FIXME FALSE ?
+               vec_infile                = "",
+               vec_outfile               = "",
+            }, -- level 0
+
+
+            {
+               geo_block_size            = block_size2,  -- Block size
+               spin_block_size           = 1,             -- 2 for level 0, 1 afterwards
+               n_vec                     = 24,            -- Number of Null vectors, 24 or 32 usually work well
+               precision_null            = quda_prec_null,        -- Precision to store the Null-space vectors
+               nu_pre                    = 2,             -- Number of pre-smoother applications
+               nu_post                   = 2,             -- Number of post-smoother applications
+               omega                     = 1.00,           -- Over/under relaxation factor for the smoother at each level, 0.8-1.0
+               verbosity                 = "SUMMARIZE",   -- Verbosity on each level of the multigrid
+               setup_inv_type            = "BICGSTAB", --"BICGSTAB",    -- Inverter to use in the setup phase
+               num_setup_iter            = 1,             -- experimental, keep to one for now
+               setup_tol                 = 5e-6,          -- Tolerance to use in the setup phase, usually set to5e-6
+               setup_maxiter             = 3000,           -- Maximum number of iterations for each setup solver, usually set to 500
+               coarse_solver             = "GCR",         -- The solver that wraps around the coarse grid correction and smoother (levels 1+)
+               coarse_solver_tol         = 0.25,          -- Tolerance for the solver that wraps around the coarse grid correction and smoother (levels 1+)
+               coarse_solver_maxiter     = 100,         -- Tolerance for the solver that wraps around the coarse grid correction and smoother (levels 1+)
+               smoother                  = "MR",          -- Smoother to use on each level
+               smoother_tol              = 0.3,          -- Tolerance to use for the smoother / solver on each level
+               smoother_schwarz_type     = MG_schwarz_type, --,"INVALID"    -- Whether to use additive or multiplicative Schwarz preconditioning in the smoother
+               smoother_schwarz_cycle    = 1,
+               smoother_solve_type       = "DIRECT_PC",   -- The type of smoother solve to do on each grid (e/o preconditioning or not)
+               smoother_halo_precision   = quda_halo_prec,
+               coarse_grid_solution_type = MG_coarse_grid_solution_type,       -- The type of residual to send to the next coarse grid, and thus the type of solution to receive back from this coarse grid, if smoother_solve_type == DIRECT_PC then set to MATPC, otherwise to MAT
+               cycle_type                = "RECURSIVE",   -- Set always to "RECURSIVE"
+               global_reduction          = "YES",          -- Whether to use global reductions or not for the smoother / solver at each level - experimental. If smoother_schwarz_type != FALSE, this must be set to NO
+               location                  = "CUDA",        -- MG Solver location
+               setup_location            = "CUDA",        -- Location where each level should be done
+               mu_factor                 = 1.,             -- twisted mass coarse level mu-factor, irrelevant here
+
+               setup_ca_basis              = "POWER_BASIS",
+               setup_ca_basis_size         = 4,
+               setup_ca_lambda_min         = 0.0,
+               setup_ca_lambda_max         = -1.0,
+               coarse_solver_ca_basis      = "POWER_BASIS",
+               coarse_solver_ca_basis_size = 4,
+               coarse_solver_ca_lambda_min = 0.0,
+               coarse_solver_ca_lambda_max = -1.0,
+               -- sns 2020/02/12 additions from quda[v1.0.0]
+               n_block_ortho             = 1,
+               use_eig_solver            = "NO",
+               vec_load                  = "INVALID", -- FIXME FALSE ?
+               vec_store                 = "INVALID", -- FIXME FALSE ?
+               vec_infile                = "",
+               vec_outfile               = "",
+            }, -- level 1
+
+            {
+               verbosity                 = "SUMMARIZE",         -- Verbosity on each level of the multigrid
+               smoother                  = "GCR",            -- Smoother to use on each level
+               smoother_tol              = 0.25,              -- Tolerance to use for the smoother / solver on each level
+               smoother_schwarz_type     = MG_schwarz_type, --"INVALID", -- Whether to use additive or multiplicative Schwarz preconditioning in the smoother
+               smoother_schwarz_cycle    = 1,
+               smoother_solve_type       = "DIRECT_PC",      -- The type of smoother solve to do on each grid (e/o preconditioning or not)
+               smoother_halo_precision   = quda_halo_prec,
+               --          coarse_grid_solution_type = MG_coarse_grid_solution_type,          -- The type of residual to send to the next coarse grid, and thus the type of solution to receive back from this coarse grid. If smoother_solve_type == DIRECT_PC then set to MATPC, otherwise to MAT
+               --          cycle_type                = "RECURSIVE",      -- Set always to "RECURSIVE"
+               global_reduction          = "YES",             -- Whether to use global reductions or not for the smoother / solver at each level - experimental. If smoother_schwarz_type != FALSE, this must be set to NO
+               location                  = "CUDA",           -- MG Solver location
+               setup_location            = "CUDA",           -- Location where each level should be done
+               mu_factor                 = 1.,
+
+               setup_ca_basis              = "POWER_BASIS",
+               setup_ca_basis_size         = 4,
+               setup_ca_lambda_min         = 0.0,
+               setup_ca_lambda_max         = -1.0,
+               coarse_solver_ca_basis      = "POWER_BASIS",
+               coarse_solver_ca_basis_size = 4,
+               coarse_solver_ca_lambda_min = 0.0,
+               coarse_solver_ca_lambda_max = -1.0,
+               -- sns 2020/02/12 additions from quda[v1.0.0]
+               n_block_ortho             = 1,
+               use_eig_solver            = "NO",
+               vec_load                  = "INVALID", -- FIXME FALSE ?
+               vec_store                 = "INVALID", -- FIXME FALSE ?
+               vec_infile                = "",
+               vec_outfile               = "",
+            } -- coarsest level
+         } -- levels table
+      }; -- multrigrid_params
+      ------------------------------------------------
+
+      local invert_params = {
+         kappa                              = kappa_l,
+         clover_coeff                       = c_sw * kappa_l,
+         Ls                                 = 1,
+         sp_pad                             = 0,
+         cl_pad                             = 0,
+         cpu_prec                           = quda_prec,
+         cuda_prec                          = quda_prec,
+         cuda_prec_sloppy                   = quda_prec_sloppy,
+         cuda_prec_precondition             = quda_prec_precondition,
+         preserve_source                    = "NO",
+         gamma_basis                        = "DEGRAND_ROSSI",
+         dirac_order                        = "QDP",
+         clover_cpu_prec                    = quda_prec,
+         clover_cuda_prec                   = quda_prec,
+         clover_cuda_prec_sloppy            = quda_prec_sloppy,
+         clover_cuda_prec_precondition      = quda_prec_precondition,
+         compute_clover                     = 1,
+         compute_clover_inverse             = 1,
+         clover_order                       = "PACKED",
+         input_location                     = "CPU",
+         output_location                    = "CPU",
+         dslash_type                        = "CLOVER_WILSON",
+         dagger                             = "NO",
+         mass_normalization                 = "KAPPA",
+         solution_type                      = "MAT",
+         solve_type                         = "DIRECT_PC",
+         matpc_type                         = "EVEN_EVEN",
+         inv_type                           = "GCR",
+         verbosity                          = "SUMMARIZE",
+         verbosity_precondition             = "SUMMARIZE",
+         inv_type_precondition              = "MG",
+         pipeline                           = 0,
+         gcrNkrylov                         = 10,
+         tol                                = ama.tol,
+         residual_type                      = "L2_RELATIVE",
+         tol_hq                             = 0.0,
+         maxiter                            = 10000,
+         reliable_delta                     = 1e-4,
+         schwarz_type                       = "INVALID",
+         precondition_cycle                 = 1,
+         tol_precondition                   = 0.1,
+         maxiter_precondition               = 1,
+         omega                              = 1.0
+      };
+
+      local inner_params = {
+         kappa                              = kappa_l,
+         clover_coeff                       = c_sw * kappa_l,
+         Ls                                 = 1,                       -- Hard coded
+         sp_pad                             = 0,                       -- Hard coded
+         cl_pad                             = 0,                       -- Hard coded
+         cpu_prec                           = quda_prec,
+         cuda_prec                          = quda_prec,
+         cuda_prec_sloppy                   = quda_prec_sloppy,
+         cuda_prec_precondition             = quda_prec_precondition,
+         preserve_source                    = "NO",                    -- Hard coded
+         gamma_basis                        = "DEGRAND_ROSSI",         -- Hard coded
+         dirac_order                        = "DIRAC_ORDER",           -- Hard coded
+         clover_cpu_prec                    = quda_prec,
+         clover_cuda_prec                   = quda_prec,
+         clover_cuda_prec_sloppy            = quda_prec_sloppy,
+         clover_cuda_prec_precondition      = quda_prec_precondition,
+         clover_order                       = "PACKED",                -- Hard coded
+         input_location                     = "CPU",                   -- Hard coded
+         output_location                    = "CPU",                   -- Hard coded
+         dslash_type                        = "CLOVER_WILSON",
+         dagger                             = "NO",                    -- Hard coded
+         mass_normalization                 = "KAPPA",                 -- Hard coded
+         matpc_type                         = "EVEN_EVEN",
+         solution_type                      = "MAT",                   -- Hard coded
+         solve_type                         = "DIRECT",                -- Hard coded
+         -- Ignored by MG setup, but set to pass Init test
+         inv_type                           = "GCR",
+         tol                                = ama.tol,
+         maxiter                            = 10000,
+         reliable_delta                     = 1e-10,
+         gcrNkrylov                         = 10,
+         verbosity                          = "SUMMARIZE",
+         verbosity_precondition             = "SUMMARIZE"
+      };
+
+      --- Create Multigrid solver
+      QS = qcd.quda.inverter.multigrid(gauge_u_hyp,
+                                       gauge_params,
+                                       invert_params,
+                                       multrigrid_params,
+                                       inner_params);
+      print_obj(QS, "make_solver")
+      return make_solver_general(function(x) return QS:solve(x) end)
+   end
+ 
+else error(string.format("bad dslash_solver='%s'", rcparams.backend.dslash_solver)) end
+
+print("HERE------------------------------------------------------------")

@@ -1,0 +1,62 @@
+package.path = 'qlib/?.qlua;qlib-lhpc/?.qlua;qlua-production/?.qlua;' .. package.path
+require 'strict'
+require 'setup_util'
+require 'latvec'
+require 'stdlib'
+
+
+require "rcparams"
+
+--_rcParams.la = _rcParams.la or {} -- create table if it does not exist
+--_rcParams.la.backend = 'gpu-cublas'
+_rcParam.la = { backend = 'gpu-cublas' }
+
+------------------------------------------------------------------------------
+-- file locations
+------------------------------------------------------------------------------
+ens_top   = '.'
+data_top  = '.'
+miter = job_max_iter
+
+-- gauge file(s)
+function get_gauge_file(key)
+   return string.format('%s/gauge_a/l6464f21b7130m00119m0322a/l6464f21b7130m00119m0322a.%s', 
+			ens_top, key)
+end
+function get_gauge_gfix_file(key, gfix_type)
+  return string.format("%s/data_a/gauge_gfix/ckpoint_lat.%s.%s",
+          data_top, gfix_type, key)
+end
+function get_colmat_gfix_file(key, gfix_type)
+  return string.format("%s/data_a/colmat_gfix/colmat_gfix.%s.%s",
+          data_top, gfix_type, key)
+end
+
+-- function get_gauge_gfix_file(key, gfix_type)
+--   return string.format("%s/gauge_gfix/miter%d_ckpoint_lat.%s.%s",
+--           data_top, miter, gfix_type, key)
+-- end
+-- function get_colmat_gfix_file(key, gfix_type)
+--   return string.format("%s/colmat_gfix/miter%d_colmat_gfix.%s.%s",
+--           data_top, miter, gfix_type, key)
+-- end
+
+-------------------------------------------------------------------------------
+-- general
+-------------------------------------------------------------------------------
+assert(job_key)
+cfg_key = job_key -- job# enumerates config#
+
+printf("lattice size: 64 64 64 64\n")
+latsize   = {64,64,64,64}
+t_axis    = #latsize - 1
+rnd_seed  = 1984
+
+------------------------------------------------------------------------------
+-- gauge fixing
+------------------------------------------------------------------------------
+gfix_param = {
+  tol     = 1e-8,
+  maxiter = miter,
+  tol_switch_fletcher = 1e-8, 
+}
